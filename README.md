@@ -1,6 +1,6 @@
 # MiniOneRec（本项目改造版）
 
-基于 **MiniOneRec** 的生成式推荐实践仓库：语义 ID（SID）+ LLM（Qwen3-0.6B）微调 + 面向推荐的自研 RL（GRPO 变体），主数据集 **Amazon23 `Industrial_and_Scientific`**（13,046 items / 16,163 条 test 样本）。
+基于 **MiniOneRec** 的生成式推荐实践仓库：语义 ID（SID）+ LLM（Qwen3-0.6B）微调 + 面向推荐的 RL（GRPO + firstdiff 奖励），主数据集 **Amazon23 `Industrial_and_Scientific`**（13,046 items / 16,163 条 test 样本）。
 
 > 上游框架：MiniOneRec（Apache-2.0，arXiv 2510.24431，[HF](https://huggingface.co/kkknight/MiniOneRec)）；原始安装/全流水线说明见 **`README_OLD.md`**。本文档描述本仓库当前（2026-09）实际状态：含自研改造、实验记录与踩坑。
 
