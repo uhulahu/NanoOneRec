@@ -1,0 +1,36 @@
+data/pretrained_model/
+__pycache__
+.ipynb_checkpoints
+.claude
+
+# ===== 2026-09-08 补充：训练/评测产物不入库（代码与文档入库）=====
+outputs/
+outputs_ds/
+outputs_ntp_ds/
+outputs_rl/
+outputs_rl_baseline/
+outputs_rl_baseline_ds/
+outputs_rl_firstdiff_ds/
+outputs_lastpooling/
+ckpt_archive/
+wandb/
+logs/
+results/
+
+# 数据集（sid/raw/emb 等大文件；process 脚本保留在仓库根）
+data/Amazon23/Industrial_and_Scientific/raw/
+data/Amazon23/Industrial_and_Scientific/sid/
+data/Amazon23/Industrial_and_Scientific/emb/
+data/Amazon/
+
+# 评测临时产物（temp/*.py 分析工具保留）
+temp/Industrial_and_Scientific-*/
+
+# 参考 papers 与个人材料（不进公共提交）
+papers/
+docs/我的简历-搜推版.pdf
+docs/面试追问预演.md
+
+
+# Claude Code 本地配置（会话/设置，不入库）
+.claude/
