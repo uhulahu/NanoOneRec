@@ -1,162 +1,309 @@
-# MiniOneRec（本项目改造版）
+# MiniOneRec-Enhanced：基于 LLM 与强化学习的端到端生成式商品推荐
 
-基于 **MiniOneRec** 的生成式推荐实践仓库：语义 ID（SID）+ LLM（Qwen3-0.6B）微调 + 面向推荐的 RL（GRPO + firstdiff 奖励），主数据集 **Amazon23 `Industrial_and_Scientific`**（13,046 items / 16,163 条 test 样本）。
+本项目面向电商推荐中的**新商品冷启动**与**低频商品行为监督不足**问题，基于 Qwen3-0.6B 搭建从商品语义编码、Semantic ID（SID）构造、多任务监督微调，到推荐导向 GRPO 强化学习和约束生成的完整链路。
 
-> 上游框架：MiniOneRec（Apache-2.0，arXiv 2510.24431，[HF](https://huggingface.co/kkknight/MiniOneRec)）；原始安装/全流水线说明见 **`README_OLD.md`**。本文档描述本仓库当前（2026-09）实际状态：含自研改造、实验记录与踩坑。
+项目在 Amazon Reviews 2023 `Industrial_and_Scientific` 数据集上完成实验，覆盖 **13,046 件商品**与 **16,163 条测试样本**。核心思路是先利用商品标题与描述建立内容侧语义表示，再通过多任务学习连接商品语义与用户行为，最后利用结果级排名奖励和 First-Diff Token 级奖励优化层次 SID 的生成路径。
 
----
+> 本仓库基于开源项目 [MiniOneRec](https://github.com/AkaliKong/MiniOneRec) 进行实现与扩展。本文重点介绍本项目新增的方法、实验和工程改造；上游原始说明见 [`README_OLD.md`](README_OLD.md)。
 
-## 方法概览
+## 核心结果
 
+| 实验 | 对照 | HR@50 | NDCG@50 | 结论 |
+|---|---|---:|---:|---|
+| 多任务 SFT | NTP-only SFT | **9.66% vs 3.56%** | 0.0573 vs 0.0102 | 联合移除两类 metadata 辅助任务后，HR@50 下降 6.10pp |
+| Ranking GRPO | SFT 初始化模型 | **10.47% vs 9.72%** | **0.0613 vs 0.0569** | 完整 1 epoch 后，结果级推荐奖励带来稳定增益 |
+| Ranking + First-Diff | Ranking GRPO | **10.91% vs 10.47%** | **0.0628 vs 0.0613** | First-Diff 在 epoch-end 额外提升 HR@50 0.44pp |
+| 完整 RL | SFT 初始化模型 | **10.91% vs 9.72%** | **0.0628 vs 0.0569** | HR@50 / NDCG@50 相对提升 **12.3% / 10.5%** |
+
+> 口径注记（重要）：第 2 行消融对照均为 **ZeRO-2** 复跑（同一训练协议，HR@1 4.12% vs 0.09%）；RL 各行的"SFT 初始化模型"指 RL 实际加载的 `./outputs/final_checkpoint`（mean 变体 SFT，DDP，best=828 步，HR@50 9.72% / NDCG@50 0.0569），ZeRO-2-SFT（9.66% / 0.0573）与其评测差 ≤0.1pp，视为等价。所有数字单 seed、来自同一训练轨迹的 checkpoint；完整 HR@K/NDCG@K 聚合见 [`reports/metrics.csv`](reports/metrics.csv)（可审计）。
+
+在 750、2250、3000、3750 四组相同步数对照中，加入 First-Diff 后的 HR@50 均高于 Ranking baseline，增量分别为 **+0.48、+0.57、+0.45、+0.44pp**。这些 checkpoint 属于同一训练轨迹，不视为独立随机种子复现；当前结论限定为**单 seed 下跨训练阶段方向一致**。
+
+## 项目贡献
+
+### 1. Balanced RQ-KMeans Semantic ID
+
+使用商品标题与描述的文本向量构建三级残差量化码，将每件商品表示为层次化 SID：
+
+```text
+item text -> text embedding -> Balanced RQ-KMeans
+          -> <a_x><b_y><c_z>[<d_x>]
 ```
-交互序列 + item 文本
-   │  rq/rqkmeans_constrained.py  （RQ-KMeans 语义码本 256×256×256，3 级）
-   ▼
-SID：<a_x><b_y><c_z>（碰撞桶成员追加 <d_x> 身份消歧 token）
-   │  convert_dataset.py → sid/*/train|valid|test csv + info + index.json
-   ▼
-SFT（三任务混合，sft.py）      ← 消融证明：NTP-only 几乎学不会（HR@1 0.09% vs 4.05%）
-   │  ① next-item 预测（历史 sid 序列→target sid）
-   │  ② sid↔title 互译（metadata 语义注入）
-   │  ③ 历史 sid 序列→target title
-   ▼
-RL（rl.py，ReReTrainer=trl GRPOTrainer 子类）  ← beam 约束解码 + 逐 prompt 双 trie
-   │  奖励家族：rule / ranking / ranking_firstdiff（first-diff token 级）
-   │  token 级 advantage：组内(group)或列(column) masked z-score + all_wrong_penalty
-   ▼
-评测：test 集 beam50 约束解码（evaluate.sh → evaluate.py → calc.py）
+
+- 前三级 `<a_x><b_y><c_z>` 表示由粗到细的语义路径；
+- 对共享三级前缀的碰撞商品追加 `<d_x>`，仅用于商品身份消歧；
+- 在每级聚类中加入容量约束，避免码本坍缩并改善码字承载均衡；
+- 当前主实验使用 `rqkmeans-td-mean-20260830` 版本，last-token pooling 版本的 SFT 结果与其基本持平（HR@50 9.57% vs 9.72%），因此后续实验保持主线 SID 不变。
+
+实现见 [`rq/rqkmeans_constrained.py`](rq/rqkmeans_constrained.py)。
+
+### 2. 多任务 SFT：连接商品语义与行为转移
+
+SFT 阶段构造约 28.2 万条指令数据，联合训练三类互补任务：
+
+| 任务 | 输入 -> 输出 | 作用 |
+|---|---|---|
+| Next-Item Prediction | 历史 SID 序列 -> 下一商品 SID | 学习用户行为转移 |
+| SID-Text Alignment | SID <-> 商品标题 | 为新增 SID Token 注入商品语义 |
+| Semantic Target Prediction | 历史 SID 序列 -> 下一商品标题 | 将行为上下文与自然语言商品空间连接起来 |
+
+仅训练 Next-Item Prediction 时，模型主要依赖稀疏的 SID 共现关系；加入两类 metadata 辅助任务后，目录侧内容能够为低频乃至行为侧零交互商品提供语义锚点。
+
+#### SFT 联合消融
+
+消融实验一次性移除 `SID <-> title` 与 `历史 SID -> 下一 title` 两类辅助任务，其他训练配方保持一致：
+
+| 模型 | HR@1 | HR@50 | NDCG@50 |
+|---|---:|---:|---:|
+| 三任务 SFT（ZeRO-2） | **4.12%** | **9.66%** | 0.0573 |
+| NTP-only SFT（ZeRO-2） | 0.09% | 3.56% | 0.0102 |
+
+HR@1 从 4.12% 降至 0.09%（相对 −97.8%），HR@50 从 9.66% 降至 3.56%，NDCG@50 从 0.0573 降至 0.0102，说明**两类 metadata 辅助任务作为整体，是建立 SID 语义路由的重要组成部分**。该消融没有进一步分离两个辅助任务的单独贡献。
+
+实现见 [`sft.py`](sft.py)；标准训练与消融入口分别为 [`sft.sh`](sft.sh) 和 [`sft_ntp.sh`](sft_ntp.sh)。
+
+### 3. 推荐导向 GRPO 与 First-Diff 信用分配
+
+RL 阶段围绕 Next-Item Prediction 主任务，混合三类 prompt：
+
+1. 历史 SID 序列 -> 下一商品完整 SID；
+2. 商品标题或描述 -> 商品三级 SID 语义前缀；
+3. 历史商品标题序列 -> 下一商品完整 SID。
+
+三个子任务各采样约 10,000 条训练样本，使 RL 同时保留行为建模、内容对齐和自然语言历史建模能力。
+
+#### Ranking reward
+
+基础 GRPO 使用二值命中奖励。为区分同组候选的排序质量，本项目加入基于 Beam 位置折扣的排名惩罚：命中候选获得正向结果信号，高排名错误候选受到更强惩罚。
+
+Ranking reward 能在"组内至少存在一个正确候选"时提供比纯 0/1 奖励更细的结果级对比；如果同组 16 个候选全部错误，该项仍为全零，因此它只能**缓解**而不能消除 exact-match 奖励稀疏。
+
+#### First-Diff Token reward
+
+SID 是层次生成路径，序列级标量奖励会广播到整条 completion，无法直接指出模型从哪一级开始走错。First-Diff 将监督细化到首次分歧位置：
+
+- 首次分歧前的正确 SID Token：`+1`；
+- 首个错误 SID Token：`-1`；
+- 进入错误分支后的后续 Token：mask，不再归因；
+- 完整 SID 及停止位置均正确：所有有效位置为 `+1`；
+- 提前停止或多生成一级：在对应停止/分歧位置给出负反馈。
+
+训练时，`ranking_firstdiff` 在相同的二值命中与排名奖励上增加 First-Diff Token advantage，从而构成干净的方法消融：
+
+| Step | Ranking HR@50 | Ranking + First-Diff HR@50 | First-Diff 增量 |
+|---:|---:|---:|---:|
+| 750 | 10.06% | 10.54% | +0.48pp |
+| 2250 | 10.26% | 10.83% | +0.57pp |
+| 3000 | 10.53% | 10.98% | +0.45pp |
+| 3750 | 10.47% | 10.91% | +0.44pp |
+
+README 采用完整一轮结束时的 `checkpoint-3750` 作为主结果；`checkpoint-3000` 仅用于展示训练轨迹，不依据测试集将其选择为最终模型。
+
+实现见 [`rl.py`](rl.py) 和 [`minionerec_trainer.py`](minionerec_trainer.py)。
+
+### 4. 双 Trie 约束生成
+
+不同任务的合法输出空间并不相同：
+
+- Next-Item 与历史标题任务需要生成**完整 SID**，碰撞商品可能包含 `<d_x>`；
+- 标题/描述对齐任务只预测**三级语义前缀**，不包含无语义的身份消歧 Token。
+
+如果所有任务共用完整 SID Trie，碰撞前缀到达第三级后会被强制继续生成 `<d_x>`，导致对齐任务的正确答案无法合法结束。为此，本项目构建两棵前缀树并按 prompt 类型路由：
+
+```text
+Next-Item / History-Title -> Full-SID Trie
+Title-or-Description Alignment -> 3-Level Prefix Trie
 ```
 
-**双 trie 约束解码**（核心改造，docs/RL_IDEAS.md §9）：训练数据含两类任务——NTP 样本 target 是**全长 sid**（可含 `<d_x>`），对齐任务（title/desc→sid）target 只到**前 3 级前缀**。单一全长 trie 会强迫碰撞前缀续 `<d_x>`、屏蔽 EOS，使对齐答案不在解码支持集。故按 prompt 来源路由两套 trie：`hash_dict_full`（NTP）/ `hash_dict_prefix`（对齐，3 级即 EOS、`<d_x>` 不可达）。双 trie 纯效应（同配置 750 步对照，两个奖励家族一致）：seen×碰撞桶（S4）HR@50 **+1.6~1.7pp**、U4 +0.3~0.6pp、总量 ≈0（重分配而非提升）。
+双 Trie 保证两类目标都处于解码支持集内。在 750 步同配置对照中（ranking 与 first-diff 两个奖励家族方向一致），seen 碰撞桶 S4 的 HR@50 提升约 **+1.2~1.7pp**、unseen 碰撞桶 U4 约 +0.3~0.7pp，同时 seen 唯一桶小幅让渡；其总体作用表现为**不同商品桶之间的收益重分配，而非整体 HR 的显著提升**（总量 ≤ +0.2pp）。
 
-**first-diff token 级奖励**（收益性改造，rl.py `--reward_type ranking_firstdiff`）：
+### 5. DeepSpeed ZeRO-2 多卡训练
 
-- **动机**：beam 生成整条 sid，但序列级奖励（rule 的 0/1、ranking 的秩分）是**稀疏的标量**——模型不知道"错在哪一层"。SID 是层次码（前 3 级 = 语义前缀，第 4 级 `<d_x>` 才消歧），早期路由 token 错了后面全白费；而约束 trie 内大量候选共享前缀，同一前缀列上多组样本的路由难度高度相关。序列级监督把 credit 平均摊掉，学不动"哪一步走错"。
-- **做法**：从生成序列与 target 的**第一个不同 token**（first diff）开始做 token 级拆解——此前缀正确的 token 段获得正向梯度，分歧点起的 token 段按组内/列向 masked z-score 给优势；另配 `all_wrong_penalty`（整列全错的组附加惩罚）与 `token_norm`（group=组内 / column=跨组列标准化，抑制列间量纲噪声）。rule/ranking 仍作为标量项保留（`ranking_firstdiff` = rule + NDCG 排序惩罚 + first-diff token 级三分量加权）。
-- **收益**（稳定复现于多个 regime）：
-  - zero2 + 双 trie regime（完整 1 epoch，8 档 ckpt）：**fd 全档优于纯 ranking**，HR@50 恒 +0.45~0.48pp（fd_3000 10.98% vs bsl_3000 10.53%；NDCG@50 同步 +0.0018）；
-  - 旧 regime（单 trie）fd 家族同为最高；SFT→RL 迁移分析显示 fd 的增益集中在 unseen/深层路由桶。
-- **机制解读（谨慎表述）**：把序列级稀疏监督分解到"语义树上第一次走错的层级"，token 级优势给的是**位置明确的梯度**；配合列标准化缓解了不同前缀难度不均带来的比较噪声。结论基于单 seed + 双 regime 同向证据，属初步但稳健的工程性改进。
+SFT 与 RL 均接入 DeepSpeed ZeRO Stage 2，采用 BF16 四卡全参数训练（4× RTX 5090 / 32GB）：
 
----
+- 模型参数仍在每张 GPU 保留完整副本；
+- 梯度与 AdamW 优化器状态在多卡间分片；
+- 不使用 CPU/NVMe offload；
+- SFT 使用全局 batch 1024；
+- RL 使用 per-device batch 16、gradient accumulation 2、16 beams。
+
+RL 的采样器会将每个独立 prompt 重复 16 次形成一个 GRPO group。因此每个 optimizer step 对应：
+
+```text
+8 个独立 prompt groups x 16 条 beam completions = 128 条生成序列
+```
+
+将 per-device batch 从 32 降至 16，并把 gradient accumulation 从 1 调整为 2，在保持每次参数更新语义不变（步数/样本集/优化器更新时机与历史 32×1 完全一致）的同时降低了单次 rollout 的注意力峰值。ZeRO-2 提供基座显存余量，micro-batch 调整直接削减 rollout 峰值——历史 0.7 epoch 必现的 OOM（batch32 在 step~2661 崩溃）在 batch16×gas2 下不再复现，两组 RL 实验均跑满完整 1 epoch。
+
+**资源实测**（训练日志 / GPU 采样 CSV 见 `logs/`，实测环境版本见 [`docs/environment.txt`](docs/environment.txt)）：
+
+| 实验 | 显存（nvidia-smi 30s 采样，32G/卡） | 时长 / 吞吐 |
+|---|---|---|
+| SFT ZeRO-2（global batch 1024，早停于 1242 步） | 每卡 used 中位 20.2–21.0G、峰值 21.7–22.1G；GPU util 均值 92% | 73 min（4410s）；~3.5 s/步 |
+| RL 每段（ranking / ranking_firstdiff，各 3750 步 = 1 epoch） | 训练典型 13–17G/卡、采样瞬时峰值 24.5G（单卡） | 每段 ≈ 8400s ≈ 2h20m（2.24 s/步，30k prompts/段） |
+
+补充背景：zero2 之前同一 RL 配方的 DDP 瞬时峰值约 29.6G/32G（batch32，0.6-0.8 epoch OOM 的根因记录，见 PROGRESS.md 2026-09-03）；ZeRO-2 每卡约省 6–7G 的优化器基座（fp32 AdamW 分片），为 rollout 尖峰留出余量。
+
+#### Checkpoint 工程适配
+
+针对本地磁盘与 Transformers/DeepSpeed 保存流程，实现了以下工程改造：
+
+1. 跳过体积较大的 DeepSpeed optimizer engine checkpoint，仅保留可用于评测和部署的模型权重（每 ckpt ~9.2G → ~1.5G）；
+2. `load_best_model_at_end` 通过 `model.safetensors` 在各 rank 直接恢复最佳权重；
+3. 由 rank 0 生成并广播输出目录时间戳，避免多进程跨秒启动造成路径不一致；
+4. 保留足够数量的模型 checkpoint，防止最佳 checkpoint 在早停前被轮换删除。
+
+该方案的 resume 语义是**权重级恢复**，不会恢复 optimizer、scheduler 和完整 DeepSpeed engine 状态。
+
+实现见 [`config/ds_zero2.json`](config/ds_zero2.json) 和 [`ds_zero2_patches.py`](ds_zero2_patches.py)。
+
+## 冷启动与流行度分析
+
+本文将冷启动商品定义为：**测试目标商品在训练交互中出现次数为 0，但其目录侧标题/描述可用于 SFT 与内容对齐任务**。这对应"行为侧没有监督、内容侧 metadata 可用"的商品冷启动场景。
+
+2026-09-09 已用最终 `fd_3750`、其 ranking 对照 `bsl_3750` 与 RL 的 SFT 初始化模型重新完成分桶（工具 [`temp/freq_analysis.py`](temp/freq_analysis.py) / [`temp/item_level_analysis.py`](temp/item_level_analysis.py)，test 集 16,163 样本，商品级 macro-HR 口径 + item-cluster bootstrap 95% 置信区间；产物见 `results/freq_analysis_3750.txt`、`results/item_level_analysis_3750.txt`）：
+
+| 商品桶 | 商品数（样本数） | Δmacro HR@50（fd_3750 vs SFT） | 说明 |
+|---|---:|---:|---|
+| F0：训练交互 0 次（冷启动） | 1,065（8,494） | **+1.43pp [+1.05, +1.88]** | 稳定增益；新增命中商品 48 个、**丢失 0 个** |
+| F1–F4：训练交互 1–4 次 | 623（1,541） | 弱正（F1 +1.28 / F2 +1.73 / F3-4 **+1.29pp [+0.35, +2.36]**） | 方向一致为正；单桶商品数少、置信区间较宽（幅度估计不精确） |
+| F5–F24 | 1,933（3,725） | ≈0（+0.28 / +0.35pp，均不显著） | 中等频次基本持平 |
+| F25–F99 | 519（1,718） | **−2.23pp [−4.36, −0.10]** | 一致转负 |
+| F100+：真头部 | 88（685） | **−6.24pp [−12.54, −0.12]** | 头部商品让渡最重 |
+
+要点：
+
+1. **收益与商品流行度单调负相关**：冷启动（F0）显著正、长尾弱正、中频持平、F25+ 显著负——行级与商品级口径同向；fd_3750 在冷启动桶 48 个新增、0 丢失。
+2. **与 ranking baseline 的差异**：ranking_3750 同样呈现单调形态（F0 +0.79pp [+0.53, +1.11]、F25-99 −2.48pp、F100+ −0.52pp 不显著），但幅度更温和——First-Diff 的 token 级监督把"容量向冷启动转移"做得更彻底，代价集中在 88 个真头部商品上。
+3. **机制通道（unseen 按 RL 对齐前缀监督分 E1/E2/E3）**：直接内容对齐 +1.43pp、前缀级迁移 **+2.94pp**、无 RL 对齐监督的泛化 +0.96pp，三通道在最终模型上均统计显著（95% 置信区间整体不含 0），与"内容语义锚点经对齐任务注入、跨前缀泛化"的机制解释一致。
+4. 早期配置（fd750/fd1500 锚点）的分桶形态与此一致，趋势非最终模型独有；完整历史见 [`docs/PROGRESS.md`](docs/PROGRESS.md)。
+
+## 实验设置
+
+| 项目 | 配置 |
+|---|---|
+| 数据集 | Amazon Reviews 2023, `Industrial_and_Scientific` |
+| 商品数 | 13,046 |
+| 测试样本数 | 16,163 |
+| 硬件 | 4× RTX 5090 (32GB) |
+| Backbone | Qwen3-0.6B Base |
+| SID | Balanced RQ-KMeans, 3-level semantic prefix + optional identity token |
+| SFT | BF16, 4 GPUs, global batch 1024, early stopping（~10 epoch 上限） |
+| RL | GRPO, 3 × 10,000 prompts, 16 beams, 1 epoch（3750 步） |
+| 分布式训练 | DeepSpeed ZeRO-2, no offload |
+| 推理 | Trie-constrained Beam Search, beam size 50 |
+| 指标 | HR@[1,3,5,10,20,50], NDCG@[1,3,5,10,20,50] |
+
+本项目每条测试样本只有一个目标商品，因此 HR@K 与单目标场景下的 Recall@K 等价。NDCG@K 按目标商品首次出现的 Beam 排名计算折损（无 IDCG 归一化，故 NDCG@1 = HR@1）。
 
 ## 快速开始
 
-GPU 配置：4× RTX 5090
+### 1. 环境
 
-### 0. 环境
+依赖以 [`setup_env.sh`](setup_env.sh) 为准（`requirements.txt` 已与其 pin 对齐），实测版本记录在 [`docs/environment.txt`](docs/environment.txt)。核心：Python 3.12.3、torch 2.12.1+cu130、transformers 4.57.3（勿升 5.x：依赖 `use_model_defaults` 行为）、trl 1.12.0、deepspeed 0.19.6。
+
 ```bash
-bash setup_env.sh        # conda env recenv：torch 2.12 / transformers 4.57 / trl 1.12 / accelerate
-pip install deepspeed==0.18.0   # zero2（本机实测 0.19.6 亦可）
-wandb login              # 可选：wandb 记录
+bash setup_env.sh        # 安装/核对核心依赖；或 pip install -r requirements.txt（含 torch，走 cu130 索引）
+wandb login              # 可选：wandb 记录（脚本内 WANDB_RUN=xxx 启用）
 ```
-数据/模型（git 不入库）：`data/Amazon23/<category>/sid/rqkmeans-td-mean-20260830/{train,valid,test,info}/`、`data/pretrained_model/Qwen3-0.6B`。
 
-### 1. SFT（标准入口）
+### 2. 数据与模型
+
+训练数据、预训练模型、checkpoint 和逐样本评测结果不进入 Git 仓库。运行脚本前需准备：
+
+```text
+data/
+├── pretrained_model/Qwen3-0.6B/          # 也可用 Qwen3-Embedding-0.6B 生成向量
+└── Amazon23/Industrial_and_Scientific/
+    ├── raw/                              # 原始 .inter（已按时间切 train/valid/test）+ item.json
+    ├── emb/                              # 商品文本向量 .npy
+    └── sid/rqkmeans-td-mean-20260830/    # 主线 SID 变体（自包含）
+        ├── *.codes_constrained.npy / *.codebooks_constrained.npz / *.index.json
+        ├── train/ valid/ test/           # 交互 CSV（内嵌该变体 SID 字符串）
+        ├── info/                         # 约束解码前缀表（sid \t title \t item_id）
+        └── sid_eval.txt
+```
+
+从原始数据到 CSV 的四步流水线（本仓库相对路径；Amazon 原始数据下载与过滤参数见 `data/amazon23_data_process.sh`）：
+
 ```bash
-bash sft.sh                     # mean 变体 × zero2 × 4 卡；产物 → outputs_ds/final_checkpoint
-WANDB_RUN=my_run bash sft.sh    # 可选 wandb
-# 消融（仅 next-item 预测）：
-bash sft_ntp.sh                 # → outputs_ntp_ds/final_checkpoint
-```
-要点：`--batch_size` = **全局** batch（内部 gas = batch//micro//nproc）→ 1024 = 16×16×4；10 epoch 上限 + 早停 patience3（实测 best≈828 步）；`save_total_limit=4` 保证 best 不被轮换；每 ckpt 仅 ~1.5G（ds engine 状态已跳过，见下）。
+# ① 原始下载 → 过滤切分（产出 raw/ 的 .inter 与 .item.json）
+bash data/amazon23_data_process.sh        # 时间窗/交互数过滤参数见脚本头
 
-### 2. RL
+# ② 商品标题+描述 → embedding（Qwen3-Embedding-0.6B）
+bash rq/text2emb/amazon_text2emb.sh       # 现产 last-token+L2（-td-last.npy）；
+                                          # ⚠️ 主线 -td.npy（mean pooling、无归一化）由早期
+                                          #    GPR 分支脚本生成，npy 已保留于 emb/，无需重生成
+
+# ③ embedding → Balanced RQ-KMeans 码（编辑 EMB_PATH/SID_VARIANT 指向目标变体）
+bash rq/rqkmeans_constrained.sh           # K=256, L=3, 容量约束 min/max=n/K±1；n_jobs 必须=1
+
+# ④ SID 码 + raw 交互 → train/valid/test CSV + info（变体目录自包含）
+bash convert_dataset.sh                   # INDEX_DIR/OUTPUT_DIR 指向目标变体目录
+```
+
+变体命名与切换规则见 `data/Amazon23/Industrial_and_Scientific/README.md`：换 embedding/pooling 后按 ②→④ 重跑并全仓库替换变体目录名，CSV↔index 一致性用 `temp/` 下脚本抽样核对。
+
+### 3. SFT 与消融
+
 ```bash
-bash rl.sh                      # b/c 配置两段（ranking_firstdiff: group/column）
-bash rl_2trie.sh                # 双 trie regime：ranking / ranking_firstdiff
-bash rl_ds.sh                   # zero2 双段：baseline(ranking) / first_diff，各完整 1 epoch
-```
-要点：per-device batch 用 **16 + gas 2**（= 历史 32×1 的 128 prompts/步语义）——rollout 尖峰（fp32 SDPA）随行数线性，减半后 0.7 epoch 历史 OOM 不再复现；750 步 ckpt 自动归档 `ckpt_archive/`（对照锚点）。
+# 三任务 SFT（mean 变体 × ZeRO-2 × 4 卡，产物 outputs_ds/final_checkpoint）
+bash sft.sh
 
-### 3. 评测（test 集 beam50）
+# NTP-only 消融
+bash sft_ntp.sh
+```
+
+### 4. 完整 RL 对照
+
 ```bash
-EXP_NAME=./outputs_ds/final_checkpoint bash evaluate.sh   # 任意模型目录
-bash eval_rl_ds_ckpts.sh        # RL 8 档 ckpt 批量评测（已完成的自动跳过需手动按需）
+# 依次训练 Ranking baseline 与 Ranking + First-Diff，均为完整 1 epoch（3750 步）
+bash rl_ds.sh
 ```
-结果 json → `results/<模型路径下划线>/`；指标口径 `calc.py`：HR@[1,3,5,10,20,50]、NDCG@[1,3,5,10,20,50]（NDCG 无 IDCG 归一；K=1 时 NDCG=HR@1）。
 
----
+### 5. 评测
 
-## DeepSpeed-ZeRO2 接入（本仓库自定义）
+```bash
+# 评测任意 checkpoint
+EXP_NAME=./outputs_ds/final_checkpoint bash evaluate.sh
 
-| 文件 | 作用 |
-|---|---|
-| `config/ds_zero2.json` | transformers 格式 zero2：stage2 无 offload；batch/gas/clip 全 `"auto"` 由命令行回填 |
-| `ds_zero2_patches.py` | 三个配套 monkeypatch + `make_run_dir_name()`（rank0 广播 run 目录时间戳，防多卡跨秒竞态） |
-| sft.py / rl.py 参数 | `--deepspeed_config config/ds_zero2.json`（空 = 关闭，纯 DDP） |
+# 批量评测完整 RL 对照的 checkpoint
+bash eval_rl_ds_ckpts.sh
+```
 
-补丁做了什么（坑都在 docs/PROGRESS.md 2026-09-07 条目）：
-1. **跳过 ds engine 的 optimizer 落盘**：zero2 ckpt 的 `global_step*/` 每档 ~7.8G（fp32 分片优化器状态，仅供引擎级 resume）→ 跳过，ckpt 缩到 ~1.5G（model.safetensors 由 HF 正常保存，eval/部署不受影响；resume 本就只恢复权重）；
-2. **末端 best 恢复改 HF 直载**：`load_best_model_at_end` 在 ds 分支强制 `deepspeed_load_checkpoint`（要引擎文件，已被 1 跳过）→ zero2 每 rank 全量权重，各 rank 直接 `load_file(best/model.safetensors)`；
-3. `save_total_limit=4`：早停 patience3 ⇒ best 之后至多 3 次保存，limit 4 保证 best 目录存活。
-
-实测结论（SFT 与 RL 双验证）：**zero2 与普通 DDP 训练指标等价**（浮点归约路径差异在噪声内）；显存每卡省 ~6-7G（SFT 19.6-22G used/32G）；无加速（compute-bound，吞吐 ~298 样本/s 与 batch 无关）；RL 段 0.7 epoch 历史 OOM 的根治靠的是 **per-device batch 16 + gas 2**（削减 rollout 尖峰），zero2 只贡献基座余量。zero3 勿用（参数分片破坏逐 rank 全量权重的约束 beam 生成与 `sync_ref_model`）。
-
----
-
-## 关键结果速览（截至 2026-09-08，详见 docs/PROGRESS.md）
-
-| 实验 | HR@50（test beam50） | 结论 |
-|---|---|---|
-| SFT 三任务（mean 变体） | 9.72% | 主基线（best=828 步早停） |
-| SFT zero2（同配方） | 9.66% | 与 DDP 等价（最大偏差 0.1pp） |
-| SFT 消融 NTP-only | 3.56% | **metadata 对齐任务决定性**（HR@1 0.09% vs 4.05%） |
-| **RL zero2 fd_3000（first_diff）** | **10.98%** | 双 trie regime 内 fd 全档 > ranking（+0.45~0.48pp） |
-| RL zero2 bsl_3000（ranking） | 10.53% | 3000 步见顶，3750 微降 |
-
-分桶分析（temp/bucket_analysis.py 等）：RL 相对 SFT 的净增益几乎全部来自 **unseen**（冷启动）；按训练交互频次分桶后增益随频次单调递减、F25+（中高频）转为显著损失（见 PROGRESS 2026-09-04 条目，含商品级 macro/聚类 bootstrap 口径）。
-
----
-
-## 离线分析工具（temp/*.py）——零训练成本的分桶与机制验证
-
-所有工具直接吃评测产物 json（`[{input, output, predict(≤50 beams)}]`），不碰训练；结果文本写 `results/*.txt`。它们把"RL 提升来自哪"从整体指标拆到桶/迁移/商品级，是论文与面试分析的主要来源。
-
-| 工具 | 回答的问题 | 用法（示意） |
-|---|---|---|
-| `bucket_analysis.py` | 主分桶：seen/unseen × 3/4-token 九桶的 HR@K/NDCG@K/前缀存活 + SFT→RL 逐样本迁移 2×2（both/new/lost/neither）+ 配对 bootstrap Δ95%CI | `python temp/bucket_analysis.py --index <index.json> --train-csv "<train/*.csv>" --sft-json <SFT eval json> --model name=<RL eval json> [--model …] --out results/bucket_analysis.txt` |
-| `item_level_analysis.py` | 商品级：macro-HR（商品内样本均值→商品等权）+ item-cluster bootstrap；unseen 按 **RL 对齐曝光**分 E1/E2/E3（复刻 RLTitle2SidDataset 采样，判定"前缀是否受对齐监督"） | `python temp/item_level_analysis.py --index … --train-csv … --item-json <item.json> --sft-json … --model name=json --out results/item_level_analysis.txt` |
-| `freq_analysis.py` | **训练交互频次分桶**（长尾/冷启动/头部）：按用户重建真实交互序列（target 链不变量校验过，0/109269 违例），cnt_all 分 8 桶 × 行级/商品级 HR + cluster bootstrap Δ | `python temp/freq_analysis.py --index … --train-csv … --sft-json … --model name=json … --out results/freq_analysis.txt` |
-| `prefix_survival.py` | first-diff 是否改善**早期路由**：d1-d4 逐深度 top1/top50 前缀存活、stop 正确率（前缀找对后停/续决策） | `python temp/prefix_survival.py <eval json …>` |
-| `test_dual_trie.py` | 双 trie 行为单测（碰撞 item 在两种 trie 下的续 `<d_x>`/EOS 行为、`<d_*>` 全量不可达扫描、count-window 走树到 EOS） | `python temp/test_dual_trie.py` |
-| `verify_firstdiff.py` / `verify_token_adv.py` | first_diff_reward / `_masked_column_advantages` 的语义单测（group 抵消病理、(b) all_wrong_penalty、(c) column 跨组恢复对比） | `python temp/verify_*.py` |
-
-口径备忘（与 calc.py/评测逐位核对过）：HR@K=target 是否在 beam 前 K；NDCG 无 IDCG 归一（rank j → 1/log2(j+2)）；d_k 前缀存活分母 = T≥k 的样本；`seen` 判定 = target item 出现在 train 交互（history ∪ target）；频次桶的 cnt_all 是**去前缀重复后**的每用户真实交互数（勿用逐行 history 累计——早位置会被后续行重复携带）。
-
-关键结论落点：冷启动/长尾/头部（freq 桶）→ PROGRESS 2026-09-04；unseen 增益通道（E1/E2/E3）→ 2026-09-03；商品级稳健性 → 同条目 item-level 表。
-
----
+评测采用合法 SID 约束下的 Beam Search（beam 50），输出 HR@K、NDCG@K。逐样本 JSON 位于 `results/`（不入 Git）；聚合审计结果见 [`reports/metrics.csv`](reports/metrics.csv)。
 
 ## 目录结构
 
+```text
+rq/rqkmeans_constrained.py  # Balanced RQ-KMeans SID 构造
+data/amazon23_data_process.sh / rq/text2emb/   # 原始数据过滤 / 商品文本 embedding
+convert_dataset.py(.sh)     # 交互数据 → SID CSV + info
+sft.py / sft*.sh            # 多任务 SFT 与 NTP-only 消融
+rl.py / rl*.sh              # GRPO、Ranking、First-Diff 与完整训练入口
+minionerec_trainer.py       # 推荐约束生成与 Token advantage（ReReTrainer）
+LogitProcessor.py           # Trie 约束解码
+ds_zero2_patches.py         # ZeRO-2 checkpoint 与多 rank 路径适配
+evaluate.py(.sh) / calc.py  # Beam Search 评测与指标计算
+temp/                       # 分桶、商品级、前缀存活率、双 trie 与奖励单测
+reports/metrics.csv         # 主实验聚合指标（README 数字可审计）
+docs/PROGRESS.md            # 完整实验记录与证据边界
+docs/RL_IDEAS.md            # RL 设计讨论与消融动机
+docs/environment.txt        # 实测环境版本
 ```
-sft.py / sft.sh            # SFT 三任务/消融（--train_tasks ntp）
-rl.py / rl*.sh             # RL（ReReTrainer，奖励/双 trie/zero2 全参数入口）
-minionerec_trainer.py      # ReReTrainer：trl GRPOTrainer 子类 + 双 trie + masked 优势
-data.py                    # 数据集（SidSFTDataset、RLTitle2SidDataset…）
-LogitProcessor.py          # 约束解码（count-window + trie 路由）
-evaluate.py/.sh, calc.py   # beam50 评测与指标
-rq/rqkmeans_constrained.py # SID 码本（RQ-KMeans）
-ds_zero2_patches.py        # zero2 补丁（见上）
-config/ds_zero2.json       # zero2 配置
-temp/*.py                  # 离线分析工具（分桶/迁移/商品级/前缀存活，见"离线分析工具"节）
-docs/PROGRESS.md           # 全量实验记录（含事故与修复，最重要）
-docs/RL_IDEAS.md           # RL 设计讨论（双 trie、reward 家族）
-```
 
----
+## 局限性
 
-## 文档导航
+- 受限于时间和算力成本，当前主要结果来自 Amazon23 单一品类，尚未验证跨品类泛化；Ranking 与 First-Diff 的完整对照为单随机种子；
+- SFT 消融同时移除两个 metadata 辅助任务，未对二者的独立贡献进行区分；
+- RL 对冷启动与低频商品更有利，但**中高频与真头部商品命中率下降**（训练交互 ≥100 次的 88 个头部商品损失最重）：F25+ 各桶的下降在统计上显著（95% 置信区间整体为负，并非抽样噪声）；F100+ 桶因只有 88 件商品、置信区间很宽，下降幅度难以精确估计。该"偏向长尾"的副作用可通过**去偏**（训练中按商品频次加权、抵消对头部的系统性牺牲）或**头部保护**（为高频商品设置保底机制）等方向缓解，本项目尚未实现，可作为后续工作。
 
-- `docs/PROGRESS.md`：实验日志/结论/事故记录（分桶、迁移 bootstrap、双 trie 效应、zero2、消融、8ckpt 评测）
-- `docs/RL_IDEAS.md`：reward 变体、token 级优势、双 trie 动机
-- `README_OLD.md`：上游框架原始说明（环境/数据准备/论文复现）
+## 上游项目与许可证
 
-## 注意事项（踩过的坑）
+本项目复用并修改了 MiniOneRec、TRL 等开源项目中的部分实现：
 
-- 磁盘空间占用：outputs/ckpt_archive/results 是占用大头，注意清理；zero2 引擎 ckpt 已跳过但仍需 ~7G/run
-- resume 语义 = 权重级（优化器/scheduler 有意跳过）；续跑用 `--resume_from_checkpoint`
-- `--batch_size`（sft）是全局口径；`--train_batch_size`（rl）是 per-device 口径
-- wandb：脚本内 `WANDB_RUN` 非空才启用（online）；sft.py `report_to` 勿设 None（回落 "all" 会要求 wandb 登录）
-- 评测口径一致性：结果目录 slug 已全路径化（防撞名覆盖）；不同变体（mean/td-last）需各自数据 glob
+- MiniOneRec: <https://github.com/AkaliKong/MiniOneRec>
+- MiniOneRec technical report: <https://arxiv.org/abs/2510.24431>
+- MiniOneRec Hugging Face: <https://huggingface.co/kkknight/MiniOneRec>
+
+本项目在 **Apache-2.0** 协议下发布（见 [`LICENSE`](LICENSE)）。代码基于 MiniOneRec 与 TRL（同为 Apache-2.0）修改而来，上游版权与修改声明见 [`NOTICE`](NOTICE)。

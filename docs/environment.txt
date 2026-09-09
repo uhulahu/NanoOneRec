@@ -1,0 +1,40 @@
+# 实际运行环境（2026-09-09 于服务器实测）
+# 与 setup_env.sh / requirements.txt 的 pin 完全一致；requirements.txt 以此为准。
+
+$ python3 --version
+Python 3.12.3
+
+$ python3 -c "import torch, transformers, trl, accelerate, deepspeed; \
+  print(torch.__version__, transformers.__version__, trl.__version__, \
+        accelerate.__version__, deepspeed.__version__)"
+2.12.1+cu130 4.57.3 1.12.0 1.14.0 0.19.6
+
+核心包（pip list）:
+  torch           2.12.1+cu130        (cu130; RTX 5090 = sm_120 需 torch>=2.6)
+  transformers    4.57.3              (勿升 5.x：依赖 use_model_defaults / TrainingArguments 行为)
+  trl             1.12.0
+  accelerate      1.14.0
+  deepspeed       0.19.6              (zero2 实测可用；0.18.0 亦可)
+  datasets        5.0.1
+  pandas          3.0.5
+  safetensors     0.8.0
+  tokenizers      0.22.2
+  fire            0.7.1
+  scikit-learn    1.9.0
+  wandb           0.29.0
+  numpy           2.4.6
+
+$ nvidia-smi   (2026-09-09 复核实例)
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 595.71.05              Driver Version: 595.71.05      CUDA Version: 13.2     |
++-----------------------------------------------------------------------------------------+
+| 0  NVIDIA GeForce RTX 5090  On  |  2MiB / 32607MiB |   0%   Default (arch 12.0 / sm_120) |
++-----------------------------------------------------------------------------------------+
+
+GPU 说明（重要）：
+- 训练与 beam50 评测实验（2026-09-07~08）在 4x RTX 5090 (32GB) 上进行 ——
+  logs/gpu_sft_ds_zero2_20260907_162106.csv 与 logs/gpu_rl_ds_20260907_224813.csv
+  均含 index 0-3 四卡采样；README 中所有 "4 GPUs / 4x5090" 指该配置。
+- 2026-09-09 复核（分桶分析/文档）所在实例 nvidia-smi 仅暴露 1x RTX 5090；
+  离线分析工具只吃评测 json，不需要 4 卡。
+- 通用变量：PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True（所有训练 run 均启用）。

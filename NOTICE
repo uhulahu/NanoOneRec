@@ -1,0 +1,27 @@
+MiniOneRec-Enhanced
+Copyright (c) 2026 uhulahu
+
+This project is a modified fork of MiniOneRec
+(https://github.com/AkaliKong/MiniOneRec, Apache-2.0,
+technical report: https://arxiv.org/abs/2510.24431)
+and reuses parts of TRL (Apache-2.0).
+
+Modified files include (not exhaustive): data.py, sft.py, rl.py,
+minionerec_trainer.py, evaluate.py, calc.py, LogitProcessor.py,
+ds_zero2_patches.py, convert_dataset.py, rq/rqkmeans_constrained.py,
+and the training/evaluation shell scripts (sft.sh, sft_ntp.sh, rl.sh,
+rl_ds.sh, evaluate.sh, eval_rl_ds_ckpts.sh, convert_dataset.sh).
+
+Main modifications:
+- Per-task dual-trie constrained decoding (full-SID trie vs 3-level
+  prefix trie routed by prompt type);
+- First-diff token-level rewards for GRPO (ranking_firstdiff) with
+  group/column-normalized token advantages;
+- DeepSpeed ZeRO-2 integration with checkpoint-engine adaptations
+  (engine-state skip, best-model direct HF loading, multi-rank-safe
+  run directories);
+- Evaluation harness fixes (deterministic beam search, protocol
+  alignment) and offline bucket/migration analysis tooling.
+
+Change log and experiment records: docs/PROGRESS.md, docs/RL_IDEAS.md.
+Method overview: README.md.

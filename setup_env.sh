@@ -27,6 +27,7 @@ pip install \
     "scikit-learn==1.9.0" \
     "safetensors==0.8.0" \
     "wandb==0.29.0" \
+    "deepspeed==0.19.6" \
     -q
 
 echo "=== 4. 验证 ==="
@@ -41,4 +42,4 @@ print('环境就绪 ✓')
 
 echo "=== 5. 提醒 ==="
 echo "下一步：先跑 smoke test（模型加载+约束生成），再起训练"
-echo "  python3 tools/smoke_test_rl.py   （或直接起 rl.sh 观察前 2 分钟日志）"
+echo "  bash run_smoke.sh   （单卡冒烟：约束生成/指标核对；全量训练入口见 README 快速开始）"
