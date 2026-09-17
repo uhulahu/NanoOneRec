@@ -38,22 +38,32 @@ test 集 beam50 逐层存活漏斗（SFT | baseline-750 | fd-750/1500/2250）：
 - 问题：失去尺度校准（难组易组同幅度）、列间语义尺度混杂；±1 有界故方差可控，确定性 rollout 下 PG 方差担忧弱。
 - 地位：被 (b)/(c) 取代，仅作思路记录。
 
-## 3. 想法 (b)：z-score 保留 + 组外"全错列惩罚"（推荐首试）
+## 3. 想法 (b)：z-score 保留 + 组外"全错列惩罚"（已实验 —— **假说证伪一半**）
 
 - 机制：在 `_compute_token_advantages` 的归一化之外，对"该列所有 mask 成员同值（全 -1，即整组该层全错）"的列附加 `-λ`（不进 z-score）。
 - 语义：精准补上唯一被 z-score 抹掉的病理信息（整组在 position j 全错），其余列保持现有组内对比语义不变。
 - 性质：**anti-支持压力**——压低 16 个已生成候选 → 重归一化抬高未生成候选（含潜在正确 a）。它不能告诉模型哪个 a 对（正确答案不在支持集，任何组内方法都做不到），只对抗漂移、保住浅层覆盖。
 - 成本：~10 行内，全部改动在 minionerec_trainer.py `_compute_token_advantages`；多一个超参 λ。
 - 验证：小规模 run（sample 2000）A/B vs 现版 ranking_firstdiff → prefix_survival.py 看 d1 top50 存活率是否停止收缩。
-- **状态（2026-09-03）：已实现**。接口：rl.py `--all_wrong_penalty <λ>`（默认 0 = 关），实现为 `_masked_column_advantages` 纯函数（minionerec_trainer.py），单测 temp/verify_token_adv.py。
+- **状态（2026-09-03）：已实现**。接口：rl.py `--all_wrong_penalty <λ>`（默认 0 = 关），实现为 `_masked_column_advantages` 纯函数（`ReReTrainer._masked_column_advantages`），单测 temp/verify_token_adv.py。
+- **实验结果（已跑完；见 `PROGRESS.md` 2026-09-03「想法 (b)(c) 实验归档」）**：⚠️ **假说证伪一半** ——
+  全错列惩罚**非但没止住浅层收缩，反而加速**（d1 top50 存活 38.7 → **33.9**，全程最低，
+  即 −λ 把"磨尖分布"的引擎开到最大）；但它把**条件深层推到全场最强**（T4 d3|d2 86.4–87.5 超 fd）
+  且 **HR@1 全场最佳（0.0443）**。定性：**b = "更激进的 firstdiff"**，不是"止住漂移"。
+  该 run OOM 截断于 2250 步（b 的中段最优点是 b-1500）。
 
-## 4. 想法 (c)：列级 z-score 改跨组（batch/全局）标准化
+## 4. 想法 (c)：列级 z-score 改跨组（batch/全局）标准化（已实验 —— **假说证实**）
 
 - 机制：同列不同组的 ±1 一起做 z-score → "a 全错组" vs "含 a 对组"之间重新有对比 → 全错是全局性的坏重新可学。
 - 性质：打破组内相对语义（GRPO baseline 从"同 prompt 16 条"变成"同列全体"），需要跨进程 gather；全局列均值漂移需跟踪。
 - 成本：中（gather 已有基础，语义改动大）。
 - 与 (b) 的关系：二选一即可，先试 (b)（改动小、语义清晰）。
 - **状态（2026-09-03）：已实现**。接口：rl.py `--token_norm column`（默认 "group" = 原实现），实现同 (b) 的 `_masked_column_advantages` 纯函数。与 (b) 正交可叠加（`--token_norm column --all_wrong_penalty λ`）。
+- **实验结果（见 `PROGRESS.md` 同上）**：✅ **假说证实** —— 跨组列标准化**确实保住浅层覆盖**
+  （d1 top50 存活 **44.7** > SFT 43.4，全程平坦）；代价是条件深层学习被稀释（T3 d2|d1 仅 28–29，
+  全方法最低）→ exact hit 垫底（9.5–9.7）。定性：**c = 保 recall 但丢组内对比锐度**。
+- **三者的 trade-off 面**：浅层覆盖 (c) ⟷ 条件深度 (b) ⟷ 平衡 (fd，HR@50 上限最高 0.1070)。
+- **尚未探索**（接口已留）：(b)+(c) 叠加、λ 调小（0.5）、(c) 只对"全错列"做跨组。
 
 ## 5. 想法：离线对比 / rank loss（target 进 loss，治浅层的正解）
 
@@ -111,7 +121,7 @@ test 集 beam50 逐层存活漏斗（SFT | baseline-750 | fd-750/1500/2250）：
 → 对碰撞前缀（td-last 变体 3643/13046 = 27.9% item、1304 桶），约束解码在 3 级后**只允许 `<d_x>`、EOS 被 -inf 屏蔽**：
 
 - 目标序列 `<a><b><c>EOS` 永不在解码支持集 → 满分不可能（支持集铁律 violation）；
-- first_diff_reward 落入 else 分支（rl.py:323，k==T<L 只可能是"对齐+碰撞+路由正确"）：前三 +1、**被迫生成的 `<d_x>` 位 -1**——模型被逼输出 reward 认为错的动作，且永远没机会输出对的动作；
+- first_diff_reward 落入 else 分支（`rl.py::first_diff_reward`，k==T<L 只可能是"对齐+碰撞+路由正确"）：前三 +1、**被迫生成的 `<d_x>` 位 -1**——模型被逼输出 reward 认为错的动作，且永远没机会输出对的动作；
 - rule/ndcg 精确串匹配永不成立 → 该组恒 flag=False 整组 0（死组，非惩罚）；
 - **(b) 变体最坏情形**：16 beam 全部正确路由到桶时，d 位列全 -1 命中 all-wrong 惩罚 → 整组唯一信号 = -λ（可能是 (b) run 浅层崩溃推手）；
 - SFT 已教"3 级即停"（SFT 对齐同样截断 target），RL 在系统性摧毁它。
@@ -122,12 +132,14 @@ test 集 beam50 逐层存活漏斗（SFT | baseline-750 | fd-750/1500/2250）：
 - **效果**：对齐样本答案回到支持集 → 满分/全对可达、标量奖励可命中、与 SFT 行为一致；d 的学习完全留给 NTP（其 target 全长、有交互上下文、reward 匹配）。
 - **验证**：temp/test_dual_trie.py（400 抽样 + 全量扫描）：碰撞前缀 prefix trie 只允许 `\n→EOS`、`<d_>` 泄漏 = 0；unique 前缀两树一致；count-window 走树均可达 EOS；full trie d 层 ⊇ 桶内各 item 4th token。PASS。
 - **预期观测**：新 run 的 alignment completion 应普遍停在 3 级（vs 旧 run 被迫 4 级）；对齐组 exact/全对率跳升；rule/ndcg 标量在该子集重新有信号。
-- **局限**：eval 的 test-beam（num_beams=test_beam=20）行布局与 rollout 的 16 束不对齐——但 eval 数据集只有 NTP（kind 恒 0），回退全长 trie 无害；rl_gpr.py 未接入（默认全长不变）。
+- **局限**：eval 的 test-beam（num_beams=test_beam=20）行布局与 rollout 的 16 束不对齐——但 eval 数据集只有 NTP（kind 恒 0），回退全长 trie 无害；默认全长 trie 不变。
+  （注：原句在此提到的 `rl_gpr.py` **已不在仓库中**，2026-09-18 核查。）
 
 ## 10. 想法：只在前缀约束的候选集上算 logits（2026-09-14 讨论归档）
 
 > **状态：未实现，待实验。** 优先级取决于 §10.4 的 `log m` 诊断结果。
 > 数据来源：本轮 5090 单卡实测（`temp/probe_*`），不是估算。
+> ⚠️ **§10.1 的字节数分解有一处待复核**（总量可信、分解存疑），详见该节标注。
 
 ### 10.1 事实基础（实测）
 
@@ -135,21 +147,41 @@ test 集 beam50 逐层存活漏斗（SFT | baseline-750 | fd-750/1500/2250）：
 
 ```
 hidden_states [B,L,1024]  --lm_head-->  logits [B,L,152452]      ← 维度放大 149 倍
-                              ↓ .float()  (loss_utils.py:55)
+                              ↓ fp32 上采样
                               logits_fp32 [B,L,V]
-                              ↓ cross_entropy
-                              loss (标量)
+                              ↓ 归约 → 标量 loss
 ```
 
-`[B,L,V]` 逐项实测（N=1024 隔离测量，字节/元素）：
+> ## ⚠️ 待复核（2026-09-18 标注，**未解决** —— 用户决定暂不重跑探针）
+>
+> **存疑的不是数字，是数字的分解。**
+>
+> **总量可信**：18 字节/元素来自 `temp/probe_mem_breakdown.py` 的实测（N=1024 隔离测量），
+> 且与历史四条 OOM 预测全部吻合 —— 这个总量可以继续当经验常数用。
+>
+> **分解未验证**：下表把 18 拆成「4（上采样）+ 4（归约内部）+ 8（梯度）」时，**机制标注是按旧代码写的**，
+> 没有对当前实现复核过。两处已知不符：
+>
+> - 原引 `trl/trainer/loss_utils.py:55` —— **trl 1.12.0 已无此文件**；
+> - 原引 `cross_entropy` —— **当前 RL 路径不走它**。RL 走 `ReReTrainer._get_per_token_logps`
+>   → `trl/trainer/utils.py::selective_log_softmax`，其 bf16 分支**逐行**调用 `F.log_softmax`
+>   （注释明说是为压峰值），fp32 是内核累加类型、不是显式 `.float()`。
+>   ⚠️「逐行」意味着那个 fp32 副本**未必是整张 `[B,L,V]`** —— 这与"4 字节/元素"的展开方式有张力。
+>
+> **什么能解掉它**：拿 `temp/probe_mem_breakdown.py` 在当前代码上重跑一次即可定论。
+>
+> **在此之前的引用规则**：§10 的**结论方向**（"词表维度全算、约束施加得太晚"）**不依赖这个分解**，
+> 可以照常引用；但若要引用**精确字节数**或写进论文，须先复核。
+
+`[B,L,V]` 逐项实测（N=1024 隔离测量，字节/元素；**测的是总量，与具体归约方式无关**）：
 
 | 项 | dtype | 字节/元素 | 出处 |
 |---|---|---|---|
 | lm_head 输出 | bf16 | 2 | `modeling_qwen3.py` |
-| `.float()` 上采样副本 | fp32 | 4 | `loss_utils.py:55` |
-| cross_entropy 前向内部 | fp32 | 4 | `log_softmax` 输出 |
+| fp32 上采样副本 | fp32 | 4 | ❓机制未复核 |
+| 归约前内部缓冲 | fp32 | 4 | ❓机制未复核 |
 | 反向梯度 ×2 | fp32 | 8 | autograd |
-| **合计** | | **18** | |
+| **合计** | | **18** | ✅ 实测值 |
 
 **换算**：`18 × 152452 = 2.617 MiB/token`（与 V 无关的常数）。
 
@@ -161,9 +193,9 @@ $$\text{峰值} \approx \underbrace{1.9\text{ GiB}}_{\text{参数+优化器}} + 
 
 **关键事实：约束是在 logits 算完之后才施加的。**
 
-`LogitProcessor.py:73`：`mask[...] = 0; scores = scores + mask` —— **全词表 logits 已经算完，mask 只改变"选谁"，不省"算谁"。**
+`LogitProcessor.py::ConstrainedLogitsProcessor.__call__`：`mask[...] = 0; scores = scores + mask` —— **全词表 logits 已经算完，mask 只改变"选谁"，不省"算谁"。**
 
-序列维度**已经省了**：`minionerec_trainer.py:1316` `logits_to_keep = completion_ids.size(1)`，`modeling_qwen3.py:493` `slice(-logits_to_keep, None)` —— lm_head 只在 completion 位置上跑。
+序列维度**已经省了**：`ReReTrainer.compute_loss` 里 `logits_to_keep = completion_ids.size(1)`，再由 transformers 的 `Qwen3ForCausalLM.forward` 用 `slice(-logits_to_keep, None)` 切掉非 completion 位置 —— lm_head 只在 completion 位置上跑。
 
 **词表维度全算** —— 这就是本想法针对的。
 
@@ -187,7 +219,7 @@ logits = F.linear(hidden[:, slice_indices, :], lm_head.weight[sid_ids])   # [B, 
 
 ### 10.4 分布一致性 —— **不是"ratio 问题"**（重要澄清）
 
-⚠️ **本 trainer 没有 importance ratio。** `minionerec_trainer.py:1330`：
+⚠️ **本 trainer 没有 importance ratio。** `ReReTrainer.compute_loss`：
 
 ```python
 # surrogate；on-policy 下生成和更新之间 θ 不变（不需要修正系数） → ratio 数值恒为 1；不加 clip
@@ -206,7 +238,7 @@ $$\nabla\log\pi_S(a) = \nabla\log\pi_V(a) - \nabla\log m$$
 
 **`m` = 模型在"该位置合法 token"上的概率质量。** SFT 之后应接近 1 → 偏差可忽略；但**策略漂移时 `m` 会掉，偏差随之放大**——恰是 KL 快兜不住的时候（本实现无 clip，`beta=0.04` 的 KL 是唯一护栏）。
 
-> 代码注释已自知此事（`minionerec_trainer.py:1315`："原始分布，无 trie 约束和 mask 后的归一化"）。
+> 代码注释已自知此事（`ReReTrainer.compute_loss` 内："原始分布，无 trie 约束和 mask 后的归一化"）。
 
 **可直接监控**（`logp_V(a) − logp_S(a) = LSE_S − LSE_V = log m`）：
 
@@ -232,7 +264,7 @@ self._metrics["log_m"].append(log_m.item())
 切片后 logits 下标是 `0..782`，但 `_get_per_token_logps` 直接拿真实 token id gather：
 
 ```python
-return selective_log_softmax(logits, input_ids)     # minionerec_trainer.py:750
+return selective_log_softmax(logits, input_ids)     # ReReTrainer._get_per_token_logps
 ```
 
 **必须**先建映射 `id2pos = {tid: i for i, tid in enumerate(sid_ids)}` 并加断言。**映射错不报错，只算出错的 logp、训出错策略。**

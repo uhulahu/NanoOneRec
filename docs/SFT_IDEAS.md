@@ -7,7 +7,15 @@
 
 ## 1. 想法：用 RQ-KMeans 码本初始化新增 token 的 embedding
 
-**状态（2026-09-14）：已实现，未实验。**
+**状态（2026-09-16）：已实现并实验完毕（E1–E5）。**
+
+> **结论**（详见 [LoRA与码本初始化实验.md](LoRA与码本初始化实验.md) §8 / `PROGRESS.md` 2026-09-16 节）：
+> 码本初始化**对 LoRA 是决定性的**（HR@50 从全参的 86.1% → **99.2%**；HR@1 37.4% → 91.3%），
+> **对全参几乎无影响**（HR@50 −1.79%）—— 假说「瓶颈是容量不足、不是初始化不好」**两个方向都验证了**。
+> 打乱码本对照（E5）表明主效应是「把新 token 放进 SID 该在的向量区域」，精确的 token↔向量对应
+> 叠加一个小而稳定的增量。
+>
+> **本节以下保留实验前（09-14/09-15）的原貌**，不改写 —— 其中的推理链和实测数据是结论的来源。
 
 ### 1.1 接口
 
@@ -88,14 +96,14 @@ RQ-KMeans 码本（`codebook_0/1/2`，shape `(256, 1024)`）与 Qwen3-0.6B 的 `
 
 ## 2. 消融清单（按性价比排序）
 
-> 基线锚点：全参 SFT `outputs_ds/final_checkpoint`（best-828，HR@50 9.46%）；
-> LoRA 基线：`outputs_sft_lora/final_checkpoint`（见 PROGRESS.md 运行记录）。
+> 基线锚点：全参 SFT `outputs_ds/final_checkpoint`（best-828，zero2，HR@50 **9.66%**）；
+> LoRA 基线：`outputs_sft_lora/final_checkpoint`（HR@50 8.32%，见 PROGRESS.md 运行记录）。
 
 | # | 消融 | 接口 | 成本 | 备注 |
 |---|---|---|---|---|
 | 1 | **lr 扫描** | `LR=2e-4 bash sft_lora.sh` | 1 次 run | 1e-4 是**未调优**的起点，最可能出增量 |
 | 2 | `FREEZE_OLD_EMB=False` | `FREEZE_OLD_EMB=False bash sft_lora.sh` | 1 次 run | 零成本（内存相同，见 §3.2） |
-| 3 | **码本初始化** | `INIT_EMB=codebook OUTPUT_ROOT=...` | 1 次 run | 见 §1，需独立输出目录 |
+| 3 | ~~**码本初始化**~~ ✅ **已完成**（E1–E5，09-16） | `INIT_EMB=codebook OUTPUT_ROOT=...` | — | 见 §1 状态行；结论：对 LoRA 决定性（86.1%→99.2%）、对全参无效（−1.79%） |
 | 4 | r ∈ {8,16,32} 配 alpha=2r | `LORA_R=8 bash sft_lora.sh` | 3 次 run | 参数量消融 |
 | — | ~~训练 RMSNorm 的 γ~~ | — | — | **已排除**：全参 SFT 几乎不动 γ（相对变化中位数 0.0077% vs Linear 17.3%） |
 
@@ -121,7 +129,7 @@ logits 链路            5.56 GiB   ← 18 字节/元素 × N × V，LoRA 碰不
 reserved               ≈19.8 GiB
 ```
 
-**每 token 成本 ≈ 4.8 MiB**（推导见 `RL_IDEAS.md` §10.1）。LoRA 只能改"参数"那 12%，而 logits 链路（~55%）由 `B×L×V` 决定，与可训练参数量无关。
+**每 token 成本 ≈ 4.8 MiB**（推导见 `RL_IDEAS.md` §10.1；⚠️ 该节的**字节数分解**有一处待复核 —— 但**总量是实测的**，本节这个结论不受影响）。LoRA 只能改"参数"那 12%，而 logits 链路（~55%）由 `B×L×V` 决定，与可训练参数量无关。
 
 ### 3.2 逐卡算账：LoRA 的收益被 zero2 分片吃掉了
 
@@ -144,4 +152,6 @@ LoRA（1 卡，无分片）：  参数 1.2 + (LoRA .02 + emb .30) + (LoRA .08 + 
 
 - **码本初始化**：两空间语义对齐已实测（R²=0.40、level-0 命中 47.3%），实现已就位；它是"给答案"，只能作独立消融；真正的价值可能是**让 embedding 冻结成为可能**，从而消掉 1.25 GB 的 Adam 状态。
 - **LoRA 的定位**：不是省资源，是**参数效率 + 多租户部署**。多租户还有坑——embedding 跟着 adapter 走（不同类目的 SID token 不同），共享 base 需先改设计。
-- **优先级**：lr 扫描 > FREEZE_OLD_EMB > 码本 > r 扫描（码本若走 §1.6 路径则优先级上调）。
+- **优先级（2026-09-18 更新）**：**冻结 embedding（§1.6）** > lr 扫描 > FREEZE_OLD_EMB > r 扫描。
+  ~~码本初始化~~ **已完成**（E1–E5）；而它的结论正好把 §1.6 顶了上来 —— 码本已能把 LoRA 拉到
+  全参水平，下一步就是看能否**连 embedding 一起冻掉**，从而省掉那 1.25 GB 的 Adam 状态。

@@ -1,7 +1,10 @@
 # RL 黑话与 GRPO 实现详解
 
-> 整理日期：2026-09-02 ｜ 对应代码：minionerec_trainer.py / rl.py
-> 目的：RL 强化学习术语速查 + 本项目 GRPO 实现的关键澄清（与代码逐行对应）
+> 整理日期：2026-09-02 ｜ **修订：2026-09-18（行号引用全部改为符号名）**
+> 对应代码：minionerec_trainer.py / rl.py
+> 目的：RL 强化学习术语速查 + 本项目 GRPO 实现的关键澄清（与代码逐符号对应）
+
+> ⚠️ **为什么不再用行号**：本文初版通篇标 `minionerec_trainer.py:966-972` 这类行号。2026-09-02~09-08 的双 trie / token 级 advantage / detach / DeepSpeed 改造让该文件从 ~1100 行涨到 **1433 行**，**全部行号一次性错位 ~150 行**，§8 速查表 9 条全废。现改为**引用符号名**，不随行数变化。定位时用 `grep -n '符号名' minionerec_trainer.py`。
 
 ---
 
@@ -102,9 +105,9 @@ target 只在 reward 函数里当"判卷标准"（`completion == targets[i] → 
 |---|---|---|
 | **REINFORCE** | 最朴素策略梯度：∇logπ × R，用总回报当权重 | GRPO 的退化形式（ratio=1 时） |
 | **baseline（基线）** | 回报减去常数，不改变期望梯度、只降方差 | 组内 16 条的均值 |
-| **advantage（优势）** | A = R − baseline，比平均好多少 | `(rewards − mean)/(std + 1e-4)`，minionerec_trainer.py:972 |
+| **advantage（优势）** | A = R − baseline，比平均好多少 | `ReReTrainer._masked_column_advantages`（`mode="group"` 默认路径）：`(rewards − mean)/(std + 1e-4)` |
 | **critic（评论家）** | 学状态价值的网络，提供 baseline（Actor-Critic） | **无**——GRPO 用组统计代替，这是与 PPO 的最大区别 |
-| **credit assignment（信用分配）** | 序列里每个 token 为结果负多少责 | 同一序列所有 token 共享同一个 A（粗糙近似） |
+| **credit assignment（信用分配）** | 序列里每个 token 为结果负多少责 | 序列级奖励时所有 token 共享同一个 A（粗糙近似）；**token 级 first-diff 奖励**下由 `ReReTrainer._compute_token_advantages` 逐 token 给出（2026-09-03 新增） |
 | **GAE（广义优势估计）** | PPO 的多步折现优势 | 无（GRPO 无时间折扣） |
 
 ---
@@ -112,14 +115,18 @@ target 只在 reward 函数里当"判卷标准"（`completion == targets[i] → 
 ## 4. 损失函数两部分（公式化）
 
 ```python
-# minionerec_trainer.py:1060-1068
+# ReReTrainer.compute_loss
 per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 ref_per_token_logps = inputs["ref_per_token_logps"]
 per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
 advantages = inputs["advantages"]
-per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+# token 级 advantage 已是 2D（每 token 一格）；序列级 1D 需 unsqueeze 广播到 token 维。
+per_token_adv = advantages if advantages.dim() == 2 else advantages.unsqueeze(1)
+per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * per_token_adv
 per_token_loss = -(per_token_loss - self.beta * per_token_kl)
 ```
+
+> **2026-09-18 校正**：初版此处引的是 `advantages.unsqueeze(1)` 直接相乘；token 级 advantage 改造后改为先归一成 `per_token_adv`（按维度自适应），语义不变。
 
 ### 4.1 surrogate 项（策略梯度目标）
 
@@ -159,7 +166,7 @@ $$\mathcal{L}(\theta) = -\frac{1}{B}\sum_i \frac{1}{N_i}\sum_{t \in y_i} \left[ 
 
 - 负号：最大化奖励、最小化 KL
 - mask：只统计 completion 部分
-- A 是序列级标量，广播到序列内所有 token
+- A 是序列级标量，广播到序列内所有 token（token 级奖励时 A 本身是 per-token 的）
 - 与论文公式的差异：**无 clip**（min(r·A, clip(r)·A) 被省略）——单步 on-policy 下 ratio=1，clip 结构性无效
 
 ### 4.5 梯度推导（为什么 ∇ = A × ∇logπ）
@@ -178,9 +185,10 @@ $$\mathcal{L}(\theta) = -\frac{1}{B}\sum_i \frac{1}{N_i}\sum_{t \in y_i} \left[ 
 
 ## 5. 奖励归一化（Group Relative 的核心）
 
-**位置**：minionerec_trainer.py **966-972 行**（_prepare_inputs 内）
+**位置**：`ReReTrainer._masked_column_advantages`（纯函数；由 `_compute_token_advantages` 调用，二者都在 `_prepare_inputs` 的 advantage 段）
 
 ```python
+# mode="group"（默认，即原实现）的简化等价形式
 mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)   # 每组16条均值
 std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)     # 每组16条标准差
 mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
@@ -188,11 +196,15 @@ std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations
 advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)  # 组内 z-score
 ```
 
+> 现实现是 **masked 逐列**版本：`group_scores` 形状 `[num_groups, G, C]`（监督位 ∈ {+1,−1}，屏蔽位 0），
+> mean/std 只在**该组该列有监督的成员**上统计。序列级奖励退化为上面这段。另有 `mode="column"`
+> （跨组标准化）与 `all_wrong_penalty`（全错列惩罚）两种改造，见 `docs/RL_IDEAS.md` §3/§4。
+
 - 组 = 同一 prompt 的 16 条生成（RepeatRandomSampler 保证相邻）
 - 1e-4 防除零（16 条 reward 全相同）
-- 归一化的是**多 reward 加权求和后**的总奖励（963 行），不是每个 reward 单独归一化
+- 归一化的是**多 reward 加权求和后**的总奖励，不是每个 reward 单独归一化
 - 归一化后每组 advantage 均值≈0、标准差≈1 → reward 函数绝对数值不影响梯度，只有组内相对高低起作用
-- 同一序列所有 token 共享同一个 A
+- 序列级奖励时同一序列所有 token 共享同一个 A；token 级奖励时逐 token 不同
 
 ---
 
@@ -210,9 +222,10 @@ advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)  # 
 ### 6.1 sync_ref_model（GRPOConfig 参数）
 
 - **False**（TRL 默认）：ref = 训练开始的 SFT checkpoint（**固定**）→ KL 衡量**累计漂移**，随训练单调增长
-- **True**（本项目）：ref = 上一个 optimizer step 的 policy（**滚动**）→ KL 衡量**步间更新量**，恒定很小（实测 0.1~1.6）
+- **True**（本项目，`rl.sh` / `rl_ds.sh` 均显式传 `--sync_ref_model True`）：ref = 上一个 optimizer step 的 policy（**滚动**）→ KL 衡量**步间更新量**，恒定很小（实测 0.1~1.6）
 - 论文公式中 π_ref 指 SFT 起点（固定参照）——sync=True 改变了语义，发论文需注明
 - 显存代价：ref 模型拷贝 +1.2GB/卡（两种都要）
+- 回调注册：`ReReTrainer.__init__` 内 `self.add_callback(SyncRefModelCallback(...))`
 
 ---
 
@@ -236,7 +249,9 @@ advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)  # 
 
 **本项目**：训练 beam 路径已改 `do_sample=False`（2026-09-02 修改，与论文 3.4.1 确定性束一致）；采样束的机制 = 每 beam `torch.multinomial` 采样 2 个 token → 32 候选按累计 logprob 排序留 top-16（不是全局 top16）。
 
-### 7.2 beam search without length normalization
+---
+
+## 7.2 beam search without length normalization
 
 - beam 评分 = 累计 log 概率（每 token logp ≤ 0，长序列天然分低）
 - length normalization 是补偿手段（GNMT length penalty 等）
@@ -247,17 +262,26 @@ advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)  # 
 
 ## 8. 关键代码位置速查
 
-| 内容 | 位置 |
+> 用 `grep -n '<符号>' minionerec_trainer.py` 定位。行号会随代码演进漂移，符号不会。
+
+| 内容 | 符号 |
 |---|---|
-| reward 打分 + 加权求和 | minionerec_trainer.py 935-963 |
-| **组内归一化 advantage** | minionerec_trainer.py 966-972 |
-| ref logps 计算 | minionerec_trainer.py 897-906 |
-| surrogate + KL 损失 | minionerec_trainer.py 1060-1068 |
-| compute_loss 默认/dapo/gspo 分支 | minionerec_trainer.py 1069-1077 |
-| ref 模型创建 + sync 回调 | minionerec_trainer.py 514-522 |
-| 训练 beam generation_config | minionerec_trainer.py 489-505 |
-| 测试 beam generation_config | minionerec_trainer.py 574-582 |
-| 约束解码（hash 前缀表） | minionerec_trainer.py 529-592 |
+| reward 打分 + 加权求和 | `ReReTrainer._prepare_inputs` 的 reward 段 |
+| **组内归一化 advantage** | `ReReTrainer._masked_column_advantages`（经 `_compute_token_advantages` 调用） |
+| token 级 first-diff advantage | `ReReTrainer._compute_token_advantages` |
+| ref logps 计算 | `ReReTrainer._prepare_inputs` 的 ref logps 段 |
+| per-token logp 提取 | `ReReTrainer._get_per_token_logps` → `trl.trainer.utils.selective_log_softmax` |
+| surrogate + KL 损失 | `ReReTrainer.compute_loss` |
+| compute_loss 默认/dapo/gspo 分支 | 同上 |
+| ref 模型创建 + sync 回调 | `ReReTrainer.__init__`（`SyncRefModelCallback` 由 trl 直接 import） |
+| 训练 beam generation_config | `ReReTrainer.__init__` 的 `if self.beam_search:` 分支 |
+| 测试 beam generation_config | `ReReTrainer.__init__` 的 `self.test_generation_config = GenerationConfig(...)` |
+| 约束解码（hash 前缀表构建） | `build_sid_hash_tries()`（模块级函数，返回双 trie） |
+| 约束解码（逐步施加） | `ReReTrainer.get_hash` / `.prefix_allowed_tokens_fn` + `ConstrainedLogitsProcessor` |
+
+> ⚠️ 已知遗留：`minionerec_trainer.py` 内 `self.generation_config` beam 分支的注释里仍写着
+> 「与 test_generation_config（**574 行**）一致」——该行号已失效（现约 680 行）。属代码注释，
+> 未改动；定位请以符号名为准。
 
 ---
 
