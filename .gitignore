@@ -3,15 +3,13 @@ __pycache__
 .ipynb_checkpoints
 .claude
 
-# ===== 2026-09-08 补充：训练/评测产物不入库（代码与文档入库）=====
-outputs/
-outputs_ds/
-outputs_ntp_ds/
-outputs_rl/
-outputs_rl_baseline/
-outputs_rl_baseline_ds/
-outputs_rl_firstdiff_ds/
-outputs_lastpooling/
+# ===== 2026-09-18 修订：训练/评测产物按「模式」忽略，不再逐个枚举 =====
+# 原为逐目录枚举（outputs/ outputs_ds/ outputs_rl/ ...），每跑一个新实验都要手加一行；
+# 结果 4 个新实验目录（outputs_sft_cb / _lora / _lora_cb / _lora_cb_shuf，共 7.9G）全部漏网，
+# 一条 `git add -A` 就会把 7 个 model.safetensors 提上去
+# （GitHub 单文件上限 100MB，1.11G 的权重必然 push 失败，且 blob 会永久留在历史里）。
+# 产物目录一律以 outputs 开头 → 用一条模式覆盖全部历史与未来。
+outputs*/
 ckpt_archive/
 wandb/
 logs/
@@ -25,6 +23,8 @@ data/Amazon/
 
 # 评测临时产物（temp/*.py 分析工具保留）
 temp/Industrial_and_Scientific-*/
+# 下划线前缀 = 探针/临时脚本的输出目标（如 _probe_out/ _nods_out/）
+temp/_*
 
 # 参考 papers 与个人材料（不进公共提交）
 papers/
