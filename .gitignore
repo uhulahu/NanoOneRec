@@ -30,6 +30,8 @@ temp/_*
 papers/
 docs/我的简历-搜推版.pdf
 docs/面试追问预演.md
+# 本机磁盘运维记账（随配额变动即过期；其中"ckpt_archive 不可删"一条已固化进 PROGRESS.md）
+docs/磁盘清理记录.md
 
 
 # Claude Code 本地配置（会话/设置，不入库）

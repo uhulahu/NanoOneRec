@@ -83,7 +83,7 @@
 4. **backbone**：维持 base（README 官方 workaround）；若换 Instruct 需先验证 CC 指标为 0
 5. 训练质量观察：eval_loss 2.09 vs train_loss 0.62 存在过拟合 gap，SFT 阶段可接受（论文同样早停）
 
-## 2026-09-03 RL（ranking_firstdiff, GRPO）评估归档 — 权重已删，此表为唯一权威记录
+## 2026-09-03 RL（ranking_firstdiff, GRPO）评估归档 — 此表为权威记录
 
 **run**: outputs_rl/run_20260902_211136（sample 10000 ×3 任务，ranking_firstdiff，epoch 0.6 = 2250 步即中断）
 **口径**: test 集 + beam50 约束解码（evaluate_rl.sh 流水线）；原始 json 在 results/run_20260902_211136_checkpoint-{750,1500,2250}/final_result_Industrial_and_Scientific.json
@@ -506,6 +506,14 @@ metadata 任务注入。面试口径：消融下限 = NTP-only（HR@50 3.56%）�
 v2 减半 rollout 行数后峰值 ~16.8-24.5G、两段各跑满 3750。评测=test 集 beam50 约束解码，json 在
 results/<ckpt路径下划线>/，日志 eval_rl_ds_ckpts_20260908_052636.log + eval_fd_3750_rescue.log。
 
+> ⚠️ **资产依赖：下表 `bsl_750` / `fd_750` 的权重只存在于 `ckpt_archive/`，不可删除。**
+> `ArchiveCheckpointCallback` 用的是 `shutil.move`（搬运，不是复制；`minionerec_trainer.py:185`），
+> 所以 `outputs_rl_baseline_ds/run_20260907_224824/` 和 `outputs_rl_firstdiff_ds/run_20260908_010923/`
+> 里只有 2250/3000/3750 三档，**没有 750**。删掉 `ckpt_archive/` 就再也复现不出这两行：
+> `ckpt_archive/run_20260907_224824/checkpoint-750` → bsl_750（4.21 / 10.06 / 0.0593）；
+> `ckpt_archive/run_20260908_010923/checkpoint-750` → fd_750（4.31 / 10.54 / 0.0611）。
+> 该目录另含 `run_20260904_005316/checkpoint-750`（2026-09-03 那节点名引用，见上）。
+
 HR@[1,3,5,10,20,50]（%）；SFT 基线：mean [4.05,4.66,5.20,6.05,7.31,9.72] / zero2 [4.12,4.72,5.17,6.11,7.41,9.66]
 | ckpt | HR@1 | HR@5 | HR@10 | HR@20 | HR@50 | NDCG@50 |
 |---|---|---|---|---|---|---|
@@ -599,4 +607,23 @@ F10-24 +1.39pp（11.62→13.01）而 mac +0.35ns —— 行级增益有高频行
 - RL 段实测（供 README）：两段各 3750 步 ≈ 8401s ≈ 2h20m（2.24 s/步、30k prompts/段）；
   nvidia-smi 30s 采样训练典型 13-17G/卡、瞬时峰值 24.5G/32G（4 卡中单卡）；SFT zero2 ≈73min、
   每卡 used 中位 20.2-21.0G / 峰值 21.7-22.1G、util 均值 92%。
+
+---
+
+## 索引：专题文档
+
+本文档是**主线时间线**记录。以下专题独立成文（避免主文档过长），需要细节时直接跳转：
+
+| 文档 | 内容 | 时间 |
+|---|---|---|
+| **[LoRA与码本初始化实验.md](LoRA与码本初始化实验.md)** | 效率消融（LoRA vs 全参）+ 用 RQ-KMeans 码本初始化新增 token 的 embedding，5 组实验（E1–E5）含机制归因 | 2026-09-14 ~ 09-16 |
+| [磁盘清理记录.md](磁盘清理记录.md) | 磁盘占用盘点、分级清理方案、执行与验证；含一次 md5 差异排查 | 2026-09-17 |
+| [SFT_IDEAS.md](SFT_IDEAS.md) | SFT 阶段的改进想法与验证记录 | — |
+| [RL_IDEAS.md](RL_IDEAS.md) | RL 阶段的想法与实验设计 | — |
+| [RL黑话与GRPO实现详解.md](RL黑话与GRPO实现详解.md) | GRPO 实现细节与术语详解 | — |
+| [ReReTrainer修改分析.md](ReReTrainer修改分析.md) | ReReTrainer 相对上游的改动分析 | — |
+| [MONITORING_LOG.md](MONITORING_LOG.md) | 训练过程逐次崩溃/修复细节 | — |
+| [面试追问预演.md](面试追问预演.md) | 面试问答准备 | — |
+
+> `docs/environment.txt` 为环境事实快照（python / torch / transformers / trl / deepspeed 版本）。
 

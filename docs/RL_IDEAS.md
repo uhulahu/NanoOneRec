@@ -123,3 +123,139 @@ test 集 beam50 逐层存活漏斗（SFT | baseline-750 | fd-750/1500/2250）：
 - **验证**：temp/test_dual_trie.py（400 抽样 + 全量扫描）：碰撞前缀 prefix trie 只允许 `\n→EOS`、`<d_>` 泄漏 = 0；unique 前缀两树一致；count-window 走树均可达 EOS；full trie d 层 ⊇ 桶内各 item 4th token。PASS。
 - **预期观测**：新 run 的 alignment completion 应普遍停在 3 级（vs 旧 run 被迫 4 级）；对齐组 exact/全对率跳升；rule/ndcg 标量在该子集重新有信号。
 - **局限**：eval 的 test-beam（num_beams=test_beam=20）行布局与 rollout 的 16 束不对齐——但 eval 数据集只有 NTP（kind 恒 0），回退全长 trie 无害；rl_gpr.py 未接入（默认全长不变）。
+
+## 10. 想法：只在前缀约束的候选集上算 logits（2026-09-14 讨论归档）
+
+> **状态：未实现，待实验。** 优先级取决于 §10.4 的 `log m` 诊断结果。
+> 数据来源：本轮 5090 单卡实测（`temp/probe_*`），不是估算。
+
+### 10.1 事实基础（实测）
+
+**logits 链路的精确定义**：从最后一层 hidden state 到 loss 之间的 `[B, L, V]` 张量群。
+
+```
+hidden_states [B,L,1024]  --lm_head-->  logits [B,L,152452]      ← 维度放大 149 倍
+                              ↓ .float()  (loss_utils.py:55)
+                              logits_fp32 [B,L,V]
+                              ↓ cross_entropy
+                              loss (标量)
+```
+
+`[B,L,V]` 逐项实测（N=1024 隔离测量，字节/元素）：
+
+| 项 | dtype | 字节/元素 | 出处 |
+|---|---|---|---|
+| lm_head 输出 | bf16 | 2 | `modeling_qwen3.py` |
+| `.float()` 上采样副本 | fp32 | 4 | `loss_utils.py:55` |
+| cross_entropy 前向内部 | fp32 | 4 | `log_softmax` 输出 |
+| 反向梯度 ×2 | fp32 | 8 | autograd |
+| **合计** | | **18** | |
+
+**换算**：`18 × 152452 = 2.617 MiB/token`（与 V 无关的常数）。
+
+配合 28 层激活值 **1.96 MiB/token**（实测：同 N 下 L 取 128/256/512 激活显存完全相同 → 注意力 L² 项在 cutoff=512 量级可忽略）：
+
+$$\text{峰值} \approx \underbrace{1.9\text{ GiB}}_{\text{参数+优化器}} + N \times 4.8\text{ MiB}, \quad N = \text{micro} \times \text{批内实际 seq}$$
+
+（四条预测与历史探针实测全部吻合，含"micro=32 在 seq=256 OOM"。）
+
+**关键事实：约束是在 logits 算完之后才施加的。**
+
+`LogitProcessor.py:73`：`mask[...] = 0; scores = scores + mask` —— **全词表 logits 已经算完，mask 只改变"选谁"，不省"算谁"。**
+
+序列维度**已经省了**：`minionerec_trainer.py:1316` `logits_to_keep = completion_ids.size(1)`，`modeling_qwen3.py:493` `slice(-logits_to_keep, None)` —— lm_head 只在 completion 位置上跑。
+
+**词表维度全算** —— 这就是本想法针对的。
+
+### 10.2 想法
+
+RL 阶段输出空间被 trie 限制在 **|S| = 783**（256 `<a_*>` + 256 `<b_*>` + 256 `<c_*>` + 15 `<d_*>`），`V/|S| = 194.7`。
+
+把 lm_head 换成 S 上的切片：
+
+```python
+logits = F.linear(hidden[:, slice_indices, :], lm_head.weight[sid_ids])   # [B, L, 783]
+```
+
+### 10.3 收益
+
+| | 现在 | 切片后 |
+|---|---|---|
+| 训练 logits 显存 | 2.617 MiB/token | **0.013 MiB/token**（−99.5%） |
+| 生成 logits（`num_beams=16`） | `16 × 152452` | `16 × 783` |
+| GRPO 分布一致性 | 近似（见 10.4） | **恒等式** |
+
+### 10.4 分布一致性 —— **不是"ratio 问题"**（重要澄清）
+
+⚠️ **本 trainer 没有 importance ratio。** `minionerec_trainer.py:1330`：
+
+```python
+# surrogate；on-policy 下生成和更新之间 θ 不变（不需要修正系数） → ratio 数值恒为 1；不加 clip
+per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * per_token_adv
+```
+
+`detach()` 后因子恒为 1，梯度即 `∇log π_θ(a)` —— **纯 REINFORCE 形态**（GRPO 原始论文形态，非 TRL 加 clip 的版本）。`grep old_per_token_logps` 零命中，无从构造 ratio。
+
+**但"没有 ratio"≠"采样分布无关"**：REINFORCE 估计量 `∇log π(a)·A(a)` 的无偏性**前提就是 `a ~ π_θ`**。采样分布不是通过显式 ratio 进入的，而是通过**"哪些 action 进了 batch"**。
+
+实际情况：采样自 `π_S`（trie 受限），估计的是 `E_{a~π_V}[·]`。两者只差归一化：
+
+$$\pi_S(a) = \frac{\pi_V(a)}{m}, \qquad m(c) = \sum_{v \in S(c)} \pi_V(v \mid c)$$
+
+$$\nabla\log\pi_S(a) = \nabla\log\pi_V(a) - \nabla\log m$$
+
+**`m` = 模型在"该位置合法 token"上的概率质量。** SFT 之后应接近 1 → 偏差可忽略；但**策略漂移时 `m` 会掉，偏差随之放大**——恰是 KL 快兜不住的时候（本实现无 clip，`beta=0.04` 的 KL 是唯一护栏）。
+
+> 代码注释已自知此事（`minionerec_trainer.py:1315`："原始分布，无 trie 约束和 mask 后的归一化"）。
+
+**可直接监控**（`logp_V(a) − logp_S(a) = LSE_S − LSE_V = log m`）：
+
+```python
+log_m = (lse_allowed - lse_full).mean()      # 两次 logsumexp，成本可忽略
+self._metrics["log_m"].append(log_m.item())
+```
+
+| `log m` | 含义 | 行动 |
+|---|---|---|
+| > −0.01（m>0.99） | 近似无害 | 切片只为显存/算力 |
+| −0.05 ~ −0.01 | 轻微偏离 | 观察趋势 |
+| < −0.05（m<0.95） | **策略在往非法 token 分质量** | reward hacking 早期信号；切片升级为正确性修复 |
+
+**这个指标比 KL 更直接**：KL 衡量"离 ref 多远"，`log m` 衡量"离合法输出空间多远"。
+
+### 10.5 实施要点与三个坑
+
+**① 允许集合逐位置变化 → 切超集即可**
+`prefix_allowed_tokens_fn` 按 trie 节点返回当前位置的合法 token（第 0 位只有 `<a_*>`，第 1 位只有所选 `<a_x>` 的孩子）。固定切 783 的超集已吃掉 99.5% 收益，无需按层细分。
+
+**② token id 下标错位 —— 唯一的静默失败点** ⚠️
+切片后 logits 下标是 `0..782`，但 `_get_per_token_logps` 直接拿真实 token id gather：
+
+```python
+return selective_log_softmax(logits, input_ids)     # minionerec_trainer.py:750
+```
+
+**必须**先建映射 `id2pos = {tid: i for i, tid in enumerate(sid_ids)}` 并加断言。**映射错不报错，只算出错的 logp、训出错策略。**
+
+**③ trie token 覆盖校验（把静默错误变响亮）**
+启动时断言 trie 中可能出现的**所有** token ⊆ `sid_ids`：
+
+```python
+allowed = set().union(*self.hash_dict_full.values(), *self.hash_dict_prefix.values())
+missing = allowed - set(sid_ids)
+assert not missing, f"切片漏了 {len(missing)} 个 trie token：{sorted(missing)[:5]}"
+```
+
+**④ lm_head 梯度只流向 S 的行**
+`W[sid_ids]` 之外的行（含 tie 的 embedding 对应行）在 RL 阶段完全冻结。可接受（RL 只该调 SID 行为），但要意识到 RL 之后模型对非 SID 的输出分布不再变化。
+
+### 10.6 建议顺序
+
+1. **先加 `log m` 指标**（~10 行，不动核心逻辑），跑一段 RL 看数值
+2. `log m ≈ 0` → 切片定位为**显存/算力优化**，按显存压力排优先级
+3. `log m` 明显非 0 → 切片升级为**正确性修复**，优先级拉满
+
+### 10.7 相关方向（记录备查）
+
+- **SFT 侧不能照搬**：NTP 任务输出全是 SID（可切），但 sid↔title 互译输出任意文本（不可切）；且 SFT 一次 forward 对整条序列算 loss、三任务混批，无法按位置区分词表。要做需拆任务分别 forward，是另一个量级的改动。
+- **同族技术**：Liger-Kernel `FusedLinearCrossEntropy` / `CutCrossEntropy` —— 都是"不物化 `[B,L,V]`"。对 CE（每位置单 target）有效；本项目的 RL 也是每位置单 target（gathered logp），故同样适用，但**它们不解决"受限候选集"这一层**，只省物化。
