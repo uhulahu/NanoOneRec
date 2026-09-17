@@ -1,4 +1,4 @@
-# MiniOneRec-Enhanced 依赖锁（2026-09-09 对齐实际训练环境 recenv）
+# NanoOneRec 依赖锁（2026-09-09 对齐实际训练环境 recenv）
 # 安装/版本核对入口：bash setup_env.sh；实测版本见 docs/environment.txt。
 # RTX 5090（sm_120）需 torch>=2.6；torch 由官方 cu130 索引安装：
 
